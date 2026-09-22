@@ -265,18 +265,25 @@ def _mx2_b(a, dout):
 def _grads(p, x, y, drop=DROP):
     n = x.shape[0]
     yhat, (z1, a1, p1, z2, a2, p2, g, _) = _fwd(p, x, drop=drop)
-    # mild label smoothing
-    yoh = np.full((n, 2), 0.05, np.float32)
-    yoh[np.arange(n), y] = 0.95
-    loss = float(-np.sum(yoh * np.log(yhat.clip(1e-8))) / n)
+    # mild smoothing; cats slightly less smoothed
+    yoh = np.zeros((n, 2), np.float32)
+    for i in range(n):
+        if y[i] == 1:
+            yoh[i] = (0.04, 0.96)
+        else:
+            yoh[i] = (0.94, 0.06)
+    w = np.where(y == 1, 1.35, 1.0).astype(np.float32)
+    w = w / w.mean()
+    per = -np.sum(yoh * np.log(yhat.clip(1e-8)), 1)
+    loss = float((per * w).mean())
     acc = float((yhat.argmax(1) == y).mean())
-    dz = (yhat - yoh) / n
+    dz = ((yhat - yoh) * w[:, None]) / n
     dw3, db3 = g.T @ dz, dz.sum(0)
     dg = dz @ p["w3"].T
-    n2, h, w, c = p2.shape
+    n2, h, wmap, c = p2.shape
     dp2 = np.zeros_like(p2)
-    flat = p2.reshape(n2, h * w, c)
-    dp2.reshape(n2, h * w, c)[np.arange(n2)[:, None], flat.argmax(1), np.arange(c)] = dg
+    flat = p2.reshape(n2, h * wmap, c)
+    dp2.reshape(n2, h * wmap, c)[np.arange(n2)[:, None], flat.argmax(1), np.arange(c)] = dg
     da2 = _mx2_b(a2, dp2) * (z2 > 0)
     dp1, dk2, db2 = _col_b(p1, p["k2"], da2)
     da1 = _mx2_b(a1, dp1) * (z1 > 0)
@@ -379,7 +386,18 @@ def _metrics(yhat, yt, thr=0.5):
     fp = int(((pred == 1) & (yt == 0)).sum())
     fn = int(((pred == 0) & (yt == 1)).sum())
     tp = int(((pred == 1) & (yt == 1)).sum())
-    return {"val": val, "bal": bal, "cat": cat_rec, "neg": neg_rec, "pred": pred, "cm": (tn, fp, fn, tp)}
+    cat_conf = float(yhat[yt == 1, 1].mean()) if (yt == 1).any() else 0.0
+    cat_hi = float((yhat[yt == 1, 1] >= 0.8).mean()) if (yt == 1).any() else 0.0
+    return {
+        "val": val,
+        "bal": bal,
+        "cat": cat_rec,
+        "neg": neg_rec,
+        "pred": pred,
+        "cm": (tn, fp, fn, tp),
+        "cat_conf": cat_conf,
+        "cat_hi": cat_hi,
+    }
 
 
 def _kind_acc(pred, yt, kxt):
@@ -397,12 +415,53 @@ def _kind_acc(pred, yt, kxt):
 
 def _best_thr(yhat, yt):
     best_t, best_b, best_m = 0.5, -1.0, None
-    for t in np.linspace(0.25, 0.75, 51):
+    for t in np.linspace(0.30, 0.65, 36):
         m = _metrics(yhat, yt, thr=float(t))
-        sc = m["bal"] - 0.05 * abs(m["cat"] - m["neg"])
+        sc = 0.35 * m["bal"] + 0.30 * m["cat"] + 0.20 * m["cat_conf"] + 0.15 * m["neg"]
+        if m["neg"] < 0.35:
+            sc -= 0.12
+        if m["cat"] < 0.70:
+            sc -= 0.08
         if sc > best_b:
             best_b, best_t, best_m = sc, float(t), m
     return best_t, best_m
+
+
+def _apply_temp(p, T):
+    out = {k: v.copy() for k, v in p.items()}
+    out["w3"] = (out["w3"] / T).astype(np.float32)
+    out["b3"] = (out["b3"] / T).astype(np.float32)
+    return out
+
+
+def _calibrate(p, xt, yt, kxt):
+    # nudge cat logit + sharpen so true cats land high-confidence; keep a dog floor
+    yhat0, _ = _fwd_tta(p, xt)
+    base_dog = _kind_acc((yhat0[:, 1] >= 0.5).astype(np.int64), yt, kxt).get("dog", 0.0)
+    floor = max(0.30, base_dog - 0.18)
+    best_sc, best_p, best_meta = -1.0, p, (1.0, 0.0)
+    for bias in np.linspace(0.0, 1.8, 19):
+        for T in np.linspace(0.40, 1.0, 13):
+            pt = {k: v.copy() for k, v in p.items()}
+            pt["b3"] = pt["b3"].copy()
+            pt["b3"][1] = pt["b3"][1] + bias
+            pt = _apply_temp(pt, float(T))
+            yhat, _ = _fwd_tta(pt, xt)
+            thr, met = _best_thr(yhat, yt)
+            kinds = _kind_acc(met["pred"], yt, kxt)
+            dog = kinds.get("dog", met["neg"])
+            if dog < floor or met["cat"] < 0.75:
+                continue
+            sc = (
+                0.40 * met["cat_conf"]
+                + 0.30 * met["cat_hi"]
+                + 0.20 * met["cat"]
+                + 0.10 * dog
+            )
+            if sc > best_sc:
+                best_sc, best_p, best_meta = sc, pt, (float(T), float(bias))
+    print(f"calibrate  T={best_meta[0]:.2f}  bias={best_meta[1]:.2f}  dog_floor={floor:.0%}")
+    return best_p
 
 
 def _save_mis_grid(imgs, path, cols=8):
@@ -452,7 +511,6 @@ def main():
     for ep in range(EPOCHS):
         lr = _lr(ep)
         n = max(len(cats), len(others))
-        # oversample mined hard dog/fox negatives (not just more random ones)
         if len(hard) > 0:
             n_h = min(len(hard), n // 2)
             neg = np.concatenate(
@@ -473,28 +531,36 @@ def main():
         met = _metrics(yhat, yt, thr=0.5)
         neg_acc = float((met["pred"][-n_neg:] == 0).mean()) if n_neg else met["neg"]
         train_a = float(np.mean(accs))
-        sc = 0.5 * met["bal"] + 0.25 * met["cat"] + 0.25 * neg_acc
+        # balanced + prefer higher cat confidence
+        sc = 0.40 * met["bal"] + 0.25 * met["cat"] + 0.20 * met["cat_conf"] + 0.15 * neg_acc
         if abs(met["cat"] - neg_acc) > 0.35:
             sc -= 0.08
-        # refresh hard pool after warmup
+        if met["cat_conf"] < 0.58:
+            sc -= 0.05
         if ep >= 14 and ep % 5 == 4:
             hard = _mine_hard(p, x, y, kx, thr=0.5)
             print(f"  hard-neg pool: {len(hard)} dog/fox train FPs")
         print(
             f"epoch {ep+1:3d}  lr {lr:.5f}  loss {np.mean(losses):.3f}  "
             f"train {train_a:.0%}  val {met['val']:.0%}  gap {train_a-met['val']:+.0%}  "
-            f"bal {met['bal']:.0%}  neg {neg_acc:.0%}  cat {met['cat']:.0%}"
+            f"bal {met['bal']:.0%}  neg {neg_acc:.0%}  cat {met['cat']:.0%}  "
+            f"cconf {met['cat_conf']:.2f}  chi {met['cat_hi']:.0%}"
         )
         if sc > best_sc:
             best_sc, best = sc, {k: vv.copy() for k, vv in p.items()}
 
     p = best or {k: vv.copy() for k, vv in p.items()}
+    p = _calibrate(p, xt, yt, kxt)
     # TTA logits → threshold sweep → confusion + kind breakdown
     yhat_tta, _ = _fwd_tta(p, xt)
     thr, met = _best_thr(yhat_tta, yt)
     tn, fp, fn, tp = met["cm"]
     kinds = _kind_acc(met["pred"], yt, kxt)
-    print(f"TTA+thr={thr:.2f}  val={met['val']:.0%}  bal={met['bal']:.0%}  cat={met['cat']:.0%}  neg={met['neg']:.0%}")
+    print(
+        f"TTA+thr={thr:.2f}  val={met['val']:.0%}  bal={met['bal']:.0%}  "
+        f"cat={met['cat']:.0%}  neg={met['neg']:.0%}  "
+        f"cat_conf={met['cat_conf']:.2f}  cat≥0.8={met['cat_hi']:.0%}"
+    )
     print(f"confusion  [[tn={tn} fp={fp}]  [fn={fn} tp={tp}]]")
     print("by kind  " + "  ".join(f"{k}={v:.0%}" for k, v in kinds.items()))
 
@@ -517,6 +583,8 @@ def main():
         "balanced_acc": met["bal"],
         "dog_acc": float(kinds.get("dog", met["neg"])),
         "thr": thr,
+        "cat_conf": met["cat_conf"],
+        "cat_hi": met["cat_hi"],
         "cm": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
         "kind_acc": kinds,
         "k1": _dump(p["k1"]),
