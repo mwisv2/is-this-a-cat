@@ -1,0 +1,14 @@
+# Local
+# Serve with: python run.py
+
+.venv/
+__pycache__/
+*.pyc
+.cache/
+.DS_Store
+*.h5
+extra_pets.npz
+nn_visualization.png
+scripts/__pycache__/
+.cursor/
+web-edit/
